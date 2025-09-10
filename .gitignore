@@ -1,0 +1,14 @@
+.aider*
+*.png
+*.jpg
+*.csv
+*.txt
+*.gif
+# vscode
+.vscode/
+# transcripts
+/transcripts/
+
+# images
+/images/
+/data/
