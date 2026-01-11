@@ -29,11 +29,44 @@ Ensure you are in your virtual environment then run:
 
     python real-time-transcription.py
 
-Transcriptions will be saved in the transcripts/ directory with filenames transcription_{index:02d}.txt. You can customise options:
+Transcriptions will be saved with filenames transcription_{index:02d}.txt. You can customise options:
 
-- --model: choose model (tiny, base, small, medium, large, turbo).
-- --osc_ip and --osc_port: configure OSC output.
-- --initial_energy_threshold, --initial_record_timeout, --initial_phrase_timeout to tune detection sensitivity.
+- `--model`: choose model (tiny, base, small, medium, large, turbo).
+- `--osc_ip` and `--osc_port`: configure OSC output.
+- `--initial_energy_threshold`, `--initial_record_timeout`, `--initial_phrase_timeout`: tune detection sensitivity.
+
+### Multi-Microphone Support
+
+You can run transcription on multiple microphones simultaneously, with each microphone running in its own process.
+
+**List available microphones:**
+
+    python real-time-transcription.py --list_microphones
+
+This will show all available microphones with their indices:
+
+    Available microphone devices are:
+      [0] "Built-in Microphone"
+      [1] "USB Audio Device"
+      [2] "External Mic"
+
+**Run with multiple microphones:**
+
+Use the `--microphones` argument to specify which microphones to use (by index or partial name match):
+
+    # Using indices
+    python real-time-transcription.py --microphones 0 1 2
+
+    # Using names (partial match)
+    python real-time-transcription.py --microphones "USB" "Built-in"
+
+    # Mixed
+    python real-time-transcription.py --microphones 0 "USB"
+
+Each microphone will:
+- Run in a separate process
+- Write to its own transcription file (e.g., transcription_00.txt, transcription_01.txt)
+- Send OSC messages to incremented ports (e.g., 9000, 9001, 9002)
 
 ### System Dependencies
 
