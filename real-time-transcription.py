@@ -29,9 +29,14 @@ def list_microphones():
 def get_microphone_by_name_or_index(mic_identifier):
     """
     Get a microphone source by name (partial match) or index.
+    If mic_identifier is None, uses the system default microphone.
     Returns (source, device_index, device_name) or (None, None, None) if not found.
     """
     mic_names = sr.Microphone.list_microphone_names()
+    
+    # Handle None/empty - use system default
+    if mic_identifier is None or mic_identifier == "":
+        return sr.Microphone(sample_rate=16000), None, "System Default"
     
     # Try to parse as an integer index first
     try:
@@ -45,12 +50,17 @@ def get_microphone_by_name_or_index(mic_identifier):
         pass
     
     # Try to match by name (partial match)
-    for index, name in enumerate(mic_names):
-        if mic_identifier in name:
-            return sr.Microphone(sample_rate=16000, device_index=index), index, name
+    matches = [(index, name) for index, name in enumerate(mic_names) if mic_identifier in name]
     
-    logging.error(f"Microphone '{mic_identifier}' not found")
-    return None, None, None
+    if len(matches) == 0:
+        logging.error(f"Microphone '{mic_identifier}' not found")
+        return None, None, None
+    
+    if len(matches) > 1:
+        logging.warning(f"Multiple microphones match '{mic_identifier}': {[m[1] for m in matches]}. Using first match.")
+    
+    index, name = matches[0]
+    return sr.Microphone(sample_rate=16000, device_index=index), index, name
 
 
 def transcribe_microphone(mic_identifier, model_name, energy_threshold, record_timeout, 
@@ -59,9 +69,15 @@ def transcribe_microphone(mic_identifier, model_name, energy_threshold, record_t
     Transcription worker function for a single microphone.
     This function is designed to run in a separate process.
     """
-    # Set up logging for this process
-    logging.basicConfig(level=logging.DEBUG, 
-                        format=f'%(asctime)s - [{mic_label}] %(levelname)s - %(message)s')
+    # Configure logging for this process with a unique format
+    # Use force=True to reconfigure even if already configured in parent process
+    logger = logging.getLogger()
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter(f'%(asctime)s - [{mic_label}] %(levelname)s - %(message)s'))
+    logger.addHandler(handler)
+    logger.setLevel(logging.DEBUG)
     
     osc_client = SimpleUDPClient(osc_ip, osc_port)
     
@@ -269,8 +285,8 @@ def main():
         if 'linux' in platform:
             mic_identifier = args.default_microphone
         else:
-            # Use default microphone (index 0 or let speech_recognition pick)
-            mic_identifier = "0"
+            # Use system default microphone (None lets speech_recognition pick)
+            mic_identifier = None
         
         transcribe_microphone(
             mic_identifier=mic_identifier,
