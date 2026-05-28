@@ -59,6 +59,17 @@ Live partials decode **greedily** (no beam search) so feedback stays snappy; the
 
 - Lower `--initial_record_timeout` for more frequent partial refreshes (more CPU).
 - On CPU, use a smaller `--model` (`base` or `small`); `turbo`/`large` need a GPU for real-time partials.
+- `--final_beam_size 1` makes the final pass greedy too, cutting GPU load when the trigger feels slow.
+
+#### Backend: faster-whisper
+
+When the GPU is shared with other models (e.g. an LLM, Stable Diffusion, pose detection), use the **faster-whisper** (CTranslate2) backend — it runs the *same* Whisper weights (including `turbo`) noticeably faster and with less VRAM:
+
+```
+pip install faster-whisper
+```
+
+It is auto-detected (`--backend auto`, the default uses it when installed). Force it with `--backend faster`, or stay on the reference implementation with `--backend openai`. To shrink VRAM further at a small accuracy cost, pass `--compute_type int8_float16` (default is `float16`).
 
 ### System Dependencies
 

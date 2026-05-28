@@ -17,6 +17,73 @@ from sys import platform
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 
+# faster-whisper (CTranslate2) runs the same Whisper weights noticeably faster
+# and with less VRAM than openai-whisper — useful when the GPU is shared with
+# other models. It is optional; we fall back to openai-whisper if unavailable.
+try:
+    from faster_whisper import WhisperModel
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+
+
+def _decode_kwargs(language, initial_prompt):
+    """Decode parameters common to both backends (beam width is added per-call)."""
+    return dict(
+        language=language,
+        initial_prompt=initial_prompt,
+        temperature=0.0,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        compression_ratio_threshold=2.4,
+    )
+
+
+class OpenAIWhisperBackend:
+    """Reference openai-whisper backend."""
+
+    def __init__(self, model_name, language, initial_prompt):
+        self.model = whisper.load_model(model_name)
+        self.language = language
+        self.initial_prompt = initial_prompt
+        self.fp16 = torch.cuda.is_available()
+
+    def transcribe(self, audio_np, beam_size):
+        # openai-whisper uses greedy decoding when beam_size is None.
+        bs = beam_size if beam_size and beam_size > 1 else None
+        result = self.model.transcribe(
+            audio_np, fp16=self.fp16, logprob_threshold=-1.0,
+            beam_size=bs, best_of=bs,
+            **_decode_kwargs(self.language, self.initial_prompt),
+        )
+        return result['text'].strip()
+
+
+class FasterWhisperBackend:
+    """faster-whisper (CTranslate2) backend: same weights, faster + less VRAM."""
+
+    # openai model names -> faster-whisper model ids.
+    _ALIASES = {"turbo": "large-v3-turbo", "large": "large-v3"}
+
+    def __init__(self, model_name, language, initial_prompt, compute_type):
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model_id = self._ALIASES.get(model_name, model_name)
+        self.model = WhisperModel(model_id, device=device, compute_type=compute_type)
+        self.language = language
+        self.initial_prompt = initial_prompt
+
+    def transcribe(self, audio_np, beam_size):
+        # faster-whisper uses beam_size=1 for greedy and names the threshold
+        # log_prob_threshold; it streams segments that we join into one string.
+        bs = max(1, beam_size or 1)
+        segments, _ = self.model.transcribe(
+            audio_np, log_prob_threshold=-1.0,
+            beam_size=bs, best_of=bs,
+            **_decode_kwargs(self.language, self.initial_prompt),
+        )
+        return "".join(seg.text for seg in segments).strip()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="turbo", help="Model to use",
@@ -31,6 +98,10 @@ def main():
                         help="webrtcvad aggressiveness (0=least, 3=most). Lower keeps more soft speech.")
     parser.add_argument("--final_beam_size", default=5, type=int,
                         help="Beam width for the final, prompt-driving pass. Lower (e.g. 1) cuts GPU load on a busy GPU.")
+    parser.add_argument("--backend", default="auto", choices=["auto", "faster", "openai"],
+                        help="Inference backend. 'faster' = faster-whisper (CTranslate2): faster and lighter on VRAM. 'auto' uses it when installed.")
+    parser.add_argument("--compute_type", default="float16",
+                        help="faster-whisper compute type (e.g. float16, int8_float16, int8). int8_float16 cuts VRAM further.")
     parser.add_argument("--initial_energy_threshold", default=1000,
                         help="Initial energy level for mic to detect.", type=int)
     parser.add_argument("--initial_record_timeout", default=0.7,
@@ -90,13 +161,30 @@ def main():
     else:
         language = args.language
 
-    logging.info(f"Loading Whisper model: {model}")
-    try:
-        audio_model = whisper.load_model(model)
-        logging.info("Whisper model loaded successfully")
-    except Exception as e:
-        logging.error(f"Failed to load Whisper model: {e}")
-        return
+    backend_choice = args.backend
+    if backend_choice == "auto":
+        backend_choice = "faster" if FASTER_WHISPER_AVAILABLE else "openai"
+
+    audio_model = None
+    if backend_choice == "faster":
+        if not FASTER_WHISPER_AVAILABLE:
+            logging.warning("faster-whisper not installed (pip install faster-whisper); using openai-whisper")
+        else:
+            logging.info(f"Loading faster-whisper model: {model} ({args.compute_type})")
+            try:
+                audio_model = FasterWhisperBackend(model, language, args.initial_prompt, args.compute_type)
+                logging.info("faster-whisper model loaded successfully")
+            except Exception as e:
+                logging.error(f"faster-whisper load failed ({e}); falling back to openai-whisper")
+
+    if audio_model is None:
+        logging.info(f"Loading Whisper model: {model}")
+        try:
+            audio_model = OpenAIWhisperBackend(model, language, args.initial_prompt)
+            logging.info("Whisper model loaded successfully")
+        except Exception as e:
+            logging.error(f"Failed to load Whisper model: {e}")
+            return
 
     record_timeout = args.initial_record_timeout
     max_pause = args.initial_phrase_timeout      # hard ceiling: force-finalize after this much silence
@@ -134,28 +222,14 @@ def main():
     def is_hallucination(text):
         return text.strip().lower() in hallucinations
 
-    _common_options = dict(
-        language=language,
-        fp16=torch.cuda.is_available(),
-        condition_on_previous_text=False,
-        no_speech_threshold=0.6,
-        logprob_threshold=-1.0,
-        compression_ratio_threshold=2.4,
-        initial_prompt=args.initial_prompt,
-    )
-    # Live partials run on every refresh, so they decode greedily for the lowest
-    # possible latency (beam search is ~5x slower and would make feedback lag).
-    partial_options = dict(_common_options, beam_size=None, best_of=None, temperature=0.0)
-    # The final pass runs once, when the utterance ends and feeds the image
-    # prompt, so it can afford beam search for the cleanest transcription. On a
-    # busy GPU, drop --final_beam_size to 1 to fall back to fast greedy decoding.
-    _final_beam = args.final_beam_size if args.final_beam_size > 1 else None
-    final_options = dict(_common_options, beam_size=_final_beam, best_of=_final_beam, temperature=0.0)
+    # Live partials run on every refresh, so they decode greedily (beam_size=1)
+    # for the lowest latency. The final pass runs once, when the utterance ends
+    # and feeds the image prompt, so it can afford a wider beam for accuracy.
+    final_beam = max(1, args.final_beam_size)
 
-    def transcribe(audio_bytes, options):
+    def transcribe(audio_bytes, beam_size):
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        result = audio_model.transcribe(audio_np, **options)
-        return result['text'].strip()
+        return audio_model.transcribe(audio_np, beam_size)
 
     logging.info("Adjusting for ambient noise. Please wait...")
     with source:
@@ -213,7 +287,7 @@ def main():
         # that actually drives the image (the greedy partials were for feedback).
         if phrase_bytes:
             try:
-                refined = transcribe(phrase_bytes, final_options)
+                refined = transcribe(phrase_bytes, final_beam)
                 if refined and not is_hallucination(refined):
                     text = refined
             except Exception as e:
@@ -278,7 +352,7 @@ def main():
                         # re-transcribe the whole buffer (greedy = fast) so Whisper
                         # keeps full context without words cut at chunk boundaries.
                         phrase_bytes += audio_data
-                        text = transcribe(phrase_bytes, partial_options)
+                        text = transcribe(phrase_bytes, beam_size=1)
 
                         if text and not is_hallucination(text):
                             current_phrase = text
