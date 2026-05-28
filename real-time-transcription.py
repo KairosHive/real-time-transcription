@@ -31,8 +31,8 @@ def main():
                         help="webrtcvad aggressiveness (0=least, 3=most). Lower keeps more soft speech.")
     parser.add_argument("--initial_energy_threshold", default=1000,
                         help="Initial energy level for mic to detect.", type=int)
-    parser.add_argument("--initial_record_timeout", default=1,
-                        help="How often (seconds) live partial transcription is refreshed and sent over OSC.", type=float)
+    parser.add_argument("--initial_record_timeout", default=0.7,
+                        help="How often (seconds) live partial transcription is refreshed and sent over OSC. Lower = snappier feedback, more CPU.", type=float)
     parser.add_argument("--initial_phrase_timeout", default=3,
                         help="Longest silence (seconds) tolerated before an utterance is force-finalized.", type=float)
     # Adaptive utterance pacing: the silence needed to finalize an utterance is
@@ -132,17 +132,26 @@ def main():
     def is_hallucination(text):
         return text.strip().lower() in hallucinations
 
-    transcribe_options = dict(
+    _common_options = dict(
         language=language,
         fp16=torch.cuda.is_available(),
-        beam_size=5,
-        best_of=5,
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
         logprob_threshold=-1.0,
         compression_ratio_threshold=2.4,
         initial_prompt=args.initial_prompt,
     )
+    # Live partials run on every refresh, so they decode greedily for the lowest
+    # possible latency (beam search is ~5x slower and would make feedback lag).
+    partial_options = dict(_common_options, beam_size=None, best_of=None, temperature=0.0)
+    # The final pass runs once, when the utterance ends and feeds the image
+    # prompt, so it can afford beam search for the cleanest transcription.
+    final_options = dict(_common_options, beam_size=5, best_of=5, temperature=0.0)
+
+    def transcribe(audio_bytes, options):
+        audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        result = audio_model.transcribe(audio_np, **options)
+        return result['text'].strip()
 
     logging.info("Adjusting for ambient noise. Please wait...")
     with source:
@@ -195,6 +204,16 @@ def main():
         if not force and utterance_seconds() < min_utterance_duration:
             # Too little speech to warrant a new image yet — keep listening.
             return False
+
+        # One accurate beam-search pass over the full utterance for the prompt
+        # that actually drives the image (the greedy partials were for feedback).
+        if phrase_bytes:
+            try:
+                refined = transcribe(phrase_bytes, final_options)
+                if refined and not is_hallucination(refined):
+                    text = refined
+            except Exception as e:
+                logging.error(f"Final transcription error: {e}")
 
         transcription.append(text)
 
@@ -252,12 +271,10 @@ def main():
                         phrase_time = now
 
                         # Accumulate raw audio for the current utterance and
-                        # re-transcribe the whole buffer so Whisper keeps full
-                        # context (no words cut at chunk boundaries).
+                        # re-transcribe the whole buffer (greedy = fast) so Whisper
+                        # keeps full context without words cut at chunk boundaries.
                         phrase_bytes += audio_data
-                        audio_np = np.frombuffer(phrase_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-                        result = audio_model.transcribe(audio_np, **transcribe_options)
-                        text = result['text'].strip()
+                        text = transcribe(phrase_bytes, partial_options)
 
                         if text and not is_hallucination(text):
                             current_phrase = text

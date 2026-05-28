@@ -53,6 +53,13 @@ Finalization is **adaptive to the speaker's rhythm** rather than a fixed timeout
 
 Each utterance's audio is buffered and re-transcribed as a whole (rather than stitching together independently transcribed chunks), so Whisper keeps full context and words are not cut at chunk boundaries.
 
+#### Latency
+
+Live partials decode **greedily** (no beam search) so feedback stays snappy; the single final pass that produces the prompt uses beam search for accuracy. If feedback still lags:
+
+- Lower `--initial_record_timeout` for more frequent partial refreshes (more CPU).
+- On CPU, use a smaller `--model` (`base` or `small`); `turbo`/`large` need a GPU for real-time partials.
+
 ### System Dependencies
 
 Whisper requires the command-line tool [`ffmpeg`](https://ffmpeg.org/) to be installed on your system, which is available from most package managers:
