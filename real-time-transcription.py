@@ -31,10 +31,19 @@ def main():
                         help="webrtcvad aggressiveness (0=least, 3=most). Lower keeps more soft speech.")
     parser.add_argument("--initial_energy_threshold", default=1000,
                         help="Initial energy level for mic to detect.", type=int)
-    parser.add_argument("--initial_record_timeout", default=2,
-                        help="Initial timeout for real-time recording in seconds.", type=float)
+    parser.add_argument("--initial_record_timeout", default=1,
+                        help="How often (seconds) live partial transcription is refreshed and sent over OSC.", type=float)
     parser.add_argument("--initial_phrase_timeout", default=3,
-                        help="Initial timeout for considering a new line in transcription.", type=float)
+                        help="Longest silence (seconds) tolerated before an utterance is force-finalized.", type=float)
+    # Adaptive utterance pacing: the silence needed to finalize an utterance is
+    # learned from the speaker's own rhythm rather than fixed, so /trigger fires
+    # on natural pauses. Image changes therefore track the cadence of speech.
+    parser.add_argument("--min_pause", default=0.7, type=float,
+                        help="Shortest silence (seconds) that can ever end an utterance.")
+    parser.add_argument("--pause_margin", default=1.6, type=float,
+                        help="Multiplier applied to the learned mid-utterance pause to decide an utterance has ended.")
+    parser.add_argument("--min_utterance_duration", default=1.2, type=float,
+                        help="Minimum spoken seconds before a finalized utterance is allowed to fire /trigger.")
     if 'linux' in platform:
         parser.add_argument("--default_microphone", default='pulse',
                             help="Default microphone name for SpeechRecognition. "
@@ -88,11 +97,28 @@ def main():
         return
 
     record_timeout = args.initial_record_timeout
-    phrase_timeout = args.initial_phrase_timeout
+    max_pause = args.initial_phrase_timeout      # hard ceiling: force-finalize after this much silence
+    min_pause = args.min_pause                   # floor: never finalize on a shorter gap
+    pause_margin = args.pause_margin
+    min_utterance_duration = args.min_utterance_duration
 
     transcription = []
     current_phrase = ""
     phrase_bytes = bytes()
+
+    # Adaptive pacing state. `intra_pause` is an EWMA of the pauses the speaker
+    # takes *within* an utterance; the finalize threshold is derived from it so a
+    # fast talker's short gaps don't prematurely cut a thought, while a slow,
+    # deliberate speaker gets longer windows. Seeded at the floor.
+    intra_pause = min_pause
+
+    def utterance_end_threshold():
+        """Silence (seconds) required to consider the current utterance finished."""
+        return max(min_pause, min(max_pause, intra_pause * pause_margin))
+
+    def utterance_seconds():
+        """Spoken duration currently buffered (16 kHz mono int16)."""
+        return len(phrase_bytes) / 2 / 16000
 
     vad = webrtcvad.Vad(args.vad_aggressiveness)
 
@@ -149,28 +175,54 @@ def main():
             print(current_phrase, end='', flush=True)
         print("\n" + "="*40 + "\n")
 
-    def handle_silence(now):
+    def finalize_utterance(force=False):
+        """End the current utterance: emit it for the image pipeline and reset.
+
+        Returns True if the utterance was emitted. When `force` is False a short
+        utterance (below --min_utterance_duration) is held back so trivial
+        fragments don't change the image; the held audio keeps accumulating into
+        the next utterance. `force` (silence past the hard ceiling, or shutdown)
+        always flushes whatever is buffered.
+        """
         nonlocal phrase_time, current_phrase, transcription, phrase_bytes
 
-        if phrase_time and (now - phrase_time > timedelta(seconds=phrase_timeout)):
-            if current_phrase.strip():
-                transcription.append(current_phrase.strip())
-                osc_client.send_message("/trigger", 1)
-
-                # Write to file
-                try:
-                    with open(transcription_file_name, "a", encoding="utf-8") as file:
-                        file.write(current_phrase.strip() + "\n")
-                        file.flush()
-                except UnicodeEncodeError as e:
-                    logging.error(f"UnicodeEncodeError: {e}")
-
-                # Print transcription
-                print_transcription()
-
-                current_phrase = ""
+        text = current_phrase.strip()
+        if not text:
             phrase_bytes = bytes()
             phrase_time = None
+            return False
+
+        if not force and utterance_seconds() < min_utterance_duration:
+            # Too little speech to warrant a new image yet — keep listening.
+            return False
+
+        transcription.append(text)
+
+        # Write to file
+        try:
+            with open(transcription_file_name, "a", encoding="utf-8") as f:
+                f.write(text + "\n")
+                f.flush()
+        except UnicodeEncodeError as e:
+            logging.error(f"UnicodeEncodeError: {e}")
+
+        print_transcription()
+
+        # Final, paced signal for the LLM -> txt2img step.
+        osc_client.send_message("/transcription", text)
+        osc_client.send_message("/trigger", 1)
+
+        current_phrase = ""
+        phrase_bytes = bytes()
+        phrase_time = None
+        return True
+
+    def handle_silence(now):
+        if not phrase_time:
+            return
+        silence = (now - phrase_time).total_seconds()
+        if silence >= utterance_end_threshold():
+            finalize_utterance(force=silence >= max_pause)
 
     logging.info("Model loaded. Ready to transcribe.")
 
@@ -179,12 +231,6 @@ def main():
             while True:
                 now = datetime.utcnow()
                 if not data_queue.empty():
-                    phrase_complete = False
-                    if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
-                        phrase_complete = True
-
-                    phrase_time = now
-
                     audio_data = b''.join(data_queue.queue)
                     data_queue.queue.clear()
 
@@ -193,24 +239,21 @@ def main():
                     speech_count = sum(1 for i in range(0, len(audio_data), n) if is_speech(audio_data[i:i + n]))
 
                     if speech_count > 0:
-                        # On a new phrase, flush the completed one and reset the buffer.
-                        if phrase_complete:
-                            if current_phrase.strip():
-                                transcription.append(current_phrase.strip())
+                        # Look at the gap since the last speech to either close the
+                        # previous utterance (real pause) or learn the speaker's
+                        # within-utterance rhythm (short gap).
+                        if phrase_time:
+                            gap = (now - phrase_time).total_seconds()
+                            if gap >= utterance_end_threshold():
+                                finalize_utterance(force=gap >= max_pause)
+                            elif gap > 0.25:
+                                intra_pause = 0.3 * gap + 0.7 * intra_pause
 
-                                # Write to file
-                                file.write(current_phrase.strip() + "\n")
-                                file.flush()
+                        phrase_time = now
 
-                                # Print transcription
-                                print_transcription()
-
-                                osc_client.send_message("/trigger", 1)
-                            current_phrase = ""
-                            phrase_bytes = bytes()
-
-                        # Accumulate raw audio for the current phrase and re-transcribe
-                        # the whole buffer so Whisper has full context (no boundary cuts).
+                        # Accumulate raw audio for the current utterance and
+                        # re-transcribe the whole buffer so Whisper keeps full
+                        # context (no words cut at chunk boundaries).
                         phrase_bytes += audio_data
                         audio_np = np.frombuffer(phrase_bytes, dtype=np.int16).astype(np.float32) / 32768.0
                         result = audio_model.transcribe(audio_np, **transcribe_options)
@@ -218,8 +261,10 @@ def main():
 
                         if text and not is_hallucination(text):
                             current_phrase = text
-                            osc_client.send_message("/trigger", 0)
+                            # Live partial feedback: shows speech is being heard
+                            # without changing the image (trigger 0 = in progress).
                             osc_client.send_message("/transcription", current_phrase.strip())
+                            osc_client.send_message("/trigger", 0)
                     else:
                         handle_silence(now)
 

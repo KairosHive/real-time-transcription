@@ -36,9 +36,22 @@ Transcriptions will be saved in the transcripts/ directory with filenames transc
 - --initial_prompt: bias the model toward domain vocabulary, names, or spelling (e.g. `"Discussion about Whisper, OSC, and Scarlett 18i20."`).
 - --vad_aggressiveness: webrtcvad aggressiveness 0-3 (default 2). Lower values keep more soft/quiet speech.
 - --osc_ip and --osc_port: configure OSC output.
-- --initial_energy_threshold, --initial_record_timeout, --initial_phrase_timeout to tune detection sensitivity.
+- --initial_energy_threshold, --initial_record_timeout to tune mic sensitivity and how often the live partial is refreshed.
 
-Each phrase's audio is buffered and re-transcribed as a whole (rather than stitching together independently transcribed chunks), so Whisper keeps full context and words are not cut at chunk boundaries.
+#### OSC output and utterance pacing
+
+Two streams are sent on the same client:
+
+- `/transcription <text>` — sent on every refresh (~`--initial_record_timeout` seconds) with the evolving partial text, plus `/trigger 0`. This is the live "I'm listening" feedback; it does **not** mean the phrase is done.
+- `/transcription <text>` followed by `/trigger 1` — sent once when an utterance is *finalized*. This is the paced signal for the downstream LLM → txt2img step.
+
+Finalization is **adaptive to the speaker's rhythm** rather than a fixed timeout. The silence needed to end an utterance is learned from the pauses the speaker takes mid-sentence (an EWMA), so a fast talker's short gaps don't chop a thought in two while a slow, deliberate speaker still gets long enough windows. This keeps image changes fluid without flipping too fast. Tuning:
+
+- --min_pause / --initial_phrase_timeout: floor and ceiling (seconds) for the learned end-of-utterance silence.
+- --pause_margin: how much longer than a typical mid-sentence pause a silence must be to count as "done" (default 1.6×).
+- --min_utterance_duration: minimum spoken seconds before a finalized utterance is allowed to fire `/trigger 1`; shorter fragments keep accumulating instead of changing the image.
+
+Each utterance's audio is buffered and re-transcribed as a whole (rather than stitching together independently transcribed chunks), so Whisper keeps full context and words are not cut at chunk boundaries.
 
 ### System Dependencies
 
