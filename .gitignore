@@ -4,6 +4,9 @@
 *.csv
 *.txt
 *.gif
+# python
+__pycache__/
+*.pyc
 # vscode
 .vscode/
 # transcripts

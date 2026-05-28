@@ -187,6 +187,7 @@ class ChannelTranscriber:
         # Transcription settings
         self.model_name = config.get('model', 'turbo')
         self.language = config.get('language')
+        self.initial_prompt = config.get('initial_prompt')
         self.energy_threshold = config.get('energy_threshold', 0.01)
         self.phrase_timeout = config.get('phrase_timeout', 3.0)
         
@@ -201,6 +202,7 @@ class ChannelTranscriber:
         self.current_phrase = ""
         self.phrase_buffer = []
         self.phrase_duration = 0.0
+        self.last_transcribed_duration = 0.0
         self.last_speech_time = None
         self.running = False
         
@@ -272,20 +274,35 @@ class ChannelTranscriber:
         rms = np.sqrt(np.mean(audio ** 2))
         return rms >= self.energy_threshold
     
-    def transcribe(self, audio: np. ndarray) -> str:
+    # Whisper frequently emits these on near-silence/background noise. Drop them
+    # when they are the entire output so they don't pollute the transcript.
+    HALLUCINATIONS = {
+        "thank you.", "thank you", "thanks for watching!", "thanks for watching.",
+        "you", "bye.", "bye", ".", "you're welcome.", "okay.", "so.",
+    }
+
+    def transcribe(self, audio: np.ndarray) -> str:
         """Transcribe audio chunk"""
         if self.model is None:
             return ""
-        
+
         try:
             result = self.model.transcribe(
                 audio,
                 language=self.language,
                 fp16=torch.cuda.is_available(),
                 beam_size=5,
-                temperature=0.0,
+                best_of=5,
+                condition_on_previous_text=False,
+                no_speech_threshold=0.6,
+                logprob_threshold=-1.0,
+                compression_ratio_threshold=2.4,
+                initial_prompt=self.initial_prompt,
             )
-            return result['text']. strip()
+            text = result['text'].strip()
+            if text.lower() in self.HALLUCINATIONS:
+                return ""
+            return text
         except Exception as e:
             logging.error(f"Transcription error: {e}")
             return ""
@@ -323,7 +340,8 @@ class ChannelTranscriber:
         self.current_phrase = ""
         self.phrase_buffer = []
         self.phrase_duration = 0.0
-    
+        self.last_transcribed_duration = 0.0
+
     def audio_callback(self, indata, frames, time_info, status):
         """Audio input callback"""
         if status: 
@@ -357,26 +375,26 @@ class ChannelTranscriber:
                     self.last_speech_time = datetime.now()
                     self.phrase_buffer.append(audio)
                     self.phrase_duration += len(audio) / self.sample_rate
-                    
-                    # Transcribe periodically
-                    if self.phrase_duration >= 2.0:
-                        phrase_audio = np.concatenate(self. phrase_buffer)
+
+                    # Re-transcribe the whole phrase buffer (not just the latest
+                    # chunk) so Whisper keeps full context and words aren't cut at
+                    # chunk boundaries. The buffer is reset only on phrase finalize.
+                    if self.phrase_duration - self.last_transcribed_duration >= 2.0:
+                        phrase_audio = np.concatenate(self.phrase_buffer)
                         text = self.transcribe(phrase_audio)
-                        
+                        self.last_transcribed_duration = self.phrase_duration
+
                         if text:
-                            self.current_phrase += " " + text
-                            self. ui.realtime(self.current_phrase)
-                            
+                            self.current_phrase = text
+                            self.ui.realtime(self.current_phrase)
+
                             # Send OSC
-                            if self. osc_client:
+                            if self.osc_client:
                                 try:
-                                    self. osc_client.send_message(f"/{self.label}/live", 
-                                                                self.current_phrase. strip())
-                                except Exception: 
+                                    self.osc_client.send_message(f"/{self.label}/live",
+                                                                self.current_phrase.strip())
+                                except Exception:
                                     pass
-                        
-                        self.phrase_buffer = []
-                        self.phrase_duration = 0.0
                 
                 # Check for phrase timeout
                 if self.last_speech_time: 
@@ -449,9 +467,9 @@ class ChannelTranscriber:
         if self.phrase_buffer:
             phrase_audio = np.concatenate(self.phrase_buffer)
             text = self.transcribe(phrase_audio)
-            if text: 
-                self.current_phrase += " " + text
-        
+            if text:
+                self.current_phrase = text
+
         self.finalize_phrase()
         
         self.ui.status(f"✅ Saved to:  {self.output_file}", "ok")
@@ -501,6 +519,8 @@ Examples:
                        help='Whisper model (default: turbo)')
     parser.add_argument('--language', '-l', default=None,
                        help='Language code (default: auto-detect)')
+    parser.add_argument('--initial-prompt', default=None,
+                       help='Prompt to bias the model toward domain vocabulary, names, or spelling')
     
     # Labeling
     parser.add_argument('--label', type=str,
@@ -590,6 +610,7 @@ def main():
             'channel': args.channel,
             'model': args.model,
             'language': args.language,
+            'initial_prompt': args.initial_prompt,
             'label': args. label or f"ch{args.channel}",
             'sample_rate':  args.sample_rate,
             'energy_threshold': args.energy_threshold,

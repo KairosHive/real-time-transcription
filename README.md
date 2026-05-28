@@ -31,9 +31,14 @@ Ensure you are in your virtual environment then run:
 
 Transcriptions will be saved in the transcripts/ directory with filenames transcription_{index:02d}.txt. You can customise options:
 
-- --model: choose model (tiny, base, small, medium, large, turbo).
+- --model: choose model (tiny, base, small, medium, large, turbo). By default the English-only (`.en`) variant is used for the smaller models since it is more accurate for English; pass --non_english to keep the multilingual model.
+- --language: set the spoken language code (e.g. `en`, `fr`) to skip auto-detection and improve accuracy.
+- --initial_prompt: bias the model toward domain vocabulary, names, or spelling (e.g. `"Discussion about Whisper, OSC, and Scarlett 18i20."`).
+- --vad_aggressiveness: webrtcvad aggressiveness 0-3 (default 2). Lower values keep more soft/quiet speech.
 - --osc_ip and --osc_port: configure OSC output.
 - --initial_energy_threshold, --initial_record_timeout, --initial_phrase_timeout to tune detection sensitivity.
+
+Each phrase's audio is buffered and re-transcribed as a whole (rather than stitching together independently transcribed chunks), so Whisper keeps full context and words are not cut at chunk boundaries.
 
 ### System Dependencies
 

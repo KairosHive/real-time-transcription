@@ -23,6 +23,12 @@ def main():
                         choices=["tiny", "base", "small", "medium", "large", "turbo"])
     parser.add_argument("--non_english", action='store_true',
                         help="Don't use the English model.")
+    parser.add_argument("--language", default=None,
+                        help="Spoken language code (e.g. 'en', 'fr'). Skips auto-detection for better accuracy.")
+    parser.add_argument("--initial_prompt", default=None,
+                        help="Prompt to bias the model toward domain vocabulary, names, or spelling.")
+    parser.add_argument("--vad_aggressiveness", default=2, type=int, choices=[0, 1, 2, 3],
+                        help="webrtcvad aggressiveness (0=least, 3=most). Lower keeps more soft speech.")
     parser.add_argument("--initial_energy_threshold", default=1000,
                         help="Initial energy level for mic to detect.", type=int)
     parser.add_argument("--initial_record_timeout", default=2,
@@ -60,7 +66,19 @@ def main():
     else:
         source = sr.Microphone(sample_rate=16000)
 
+    # English-only model variants (.en) are more accurate for English speech.
+    # They only exist for tiny/base/small/medium; large and turbo are multilingual only.
     model = args.model
+    if model not in ("large", "turbo") and not args.non_english:
+        model += ".en"
+
+    # Resolve the language passed to Whisper. English-only models must use "en";
+    # otherwise honour an explicit --language and fall back to auto-detection.
+    if model.endswith(".en"):
+        language = "en"
+    else:
+        language = args.language
+
     logging.info(f"Loading Whisper model: {model}")
     try:
         audio_model = whisper.load_model(model)
@@ -74,8 +92,31 @@ def main():
 
     transcription = []
     current_phrase = ""
+    phrase_bytes = bytes()
 
-    vad = webrtcvad.Vad(3)
+    vad = webrtcvad.Vad(args.vad_aggressiveness)
+
+    # Whisper frequently emits these on near-silence/background noise. Drop them
+    # when they are the entire output so they don't pollute the transcript.
+    hallucinations = {
+        "thank you.", "thank you", "thanks for watching!", "thanks for watching.",
+        "you", "bye.", "bye", ".", "you're welcome.", "okay.", "so.",
+    }
+
+    def is_hallucination(text):
+        return text.strip().lower() in hallucinations
+
+    transcribe_options = dict(
+        language=language,
+        fp16=torch.cuda.is_available(),
+        beam_size=5,
+        best_of=5,
+        condition_on_previous_text=False,
+        no_speech_threshold=0.6,
+        logprob_threshold=-1.0,
+        compression_ratio_threshold=2.4,
+        initial_prompt=args.initial_prompt,
+    )
 
     logging.info("Adjusting for ambient noise. Please wait...")
     with source:
@@ -109,13 +150,13 @@ def main():
         print("\n" + "="*40 + "\n")
 
     def handle_silence(now):
-        nonlocal phrase_time, current_phrase, transcription
+        nonlocal phrase_time, current_phrase, transcription, phrase_bytes
 
         if phrase_time and (now - phrase_time > timedelta(seconds=phrase_timeout)):
             if current_phrase.strip():
                 transcription.append(current_phrase.strip())
                 osc_client.send_message("/trigger", 1)
-                
+
                 # Write to file
                 try:
                     with open(transcription_file_name, "a", encoding="utf-8") as file:
@@ -123,11 +164,12 @@ def main():
                         file.flush()
                 except UnicodeEncodeError as e:
                     logging.error(f"UnicodeEncodeError: {e}")
-                
+
                 # Print transcription
                 print_transcription()
-                
+
                 current_phrase = ""
+            phrase_bytes = bytes()
             phrase_time = None
 
     logging.info("Model loaded. Ready to transcribe.")
@@ -151,28 +193,33 @@ def main():
                     speech_count = sum(1 for i in range(0, len(audio_data), n) if is_speech(audio_data[i:i + n]))
 
                     if speech_count > 0:
-                        audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
-                        result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
-                        text = result['text'].strip()
-
+                        # On a new phrase, flush the completed one and reset the buffer.
                         if phrase_complete:
                             if current_phrase.strip():
                                 transcription.append(current_phrase.strip())
-                                
+
                                 # Write to file
                                 file.write(current_phrase.strip() + "\n")
                                 file.flush()
-                                
+
                                 # Print transcription
                                 print_transcription()
-                                
-                                osc_client.send_message("/trigger", 1)
-                            current_phrase = text
-                        else:
-                            current_phrase += " " + text
-                            osc_client.send_message("/trigger", 0)
 
-                        osc_client.send_message("/transcription", current_phrase.strip())
+                                osc_client.send_message("/trigger", 1)
+                            current_phrase = ""
+                            phrase_bytes = bytes()
+
+                        # Accumulate raw audio for the current phrase and re-transcribe
+                        # the whole buffer so Whisper has full context (no boundary cuts).
+                        phrase_bytes += audio_data
+                        audio_np = np.frombuffer(phrase_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                        result = audio_model.transcribe(audio_np, **transcribe_options)
+                        text = result['text'].strip()
+
+                        if text and not is_hallucination(text):
+                            current_phrase = text
+                            osc_client.send_message("/trigger", 0)
+                            osc_client.send_message("/transcription", current_phrase.strip())
                     else:
                         handle_silence(now)
 
