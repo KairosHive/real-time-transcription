@@ -71,6 +71,8 @@ pip install faster-whisper
 
 It is auto-detected (`--backend auto`, the default uses it when installed). Force it with `--backend faster`, or stay on the reference implementation with `--backend openai`. To shrink VRAM further at a small accuracy cost, pass `--compute_type int8_float16` (default is `float16`).
 
+> **Note:** `turbo` needs faster-whisper **>= 1.1.0** (`pip install -U faster-whisper`). On older versions the code falls back to downloading the converted `deepdml/faster-whisper-large-v3-turbo-ct2` model from HuggingFace, which requires an internet connection on first run.
+
 ### System Dependencies
 
 Whisper requires the command-line tool [`ffmpeg`](https://ffmpeg.org/) to be installed on your system, which is available from most package managers:

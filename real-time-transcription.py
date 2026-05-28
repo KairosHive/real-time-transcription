@@ -62,13 +62,34 @@ class OpenAIWhisperBackend:
 class FasterWhisperBackend:
     """faster-whisper (CTranslate2) backend: same weights, faster + less VRAM."""
 
-    # openai model names -> faster-whisper model ids.
-    _ALIASES = {"turbo": "large-v3-turbo", "large": "large-v3"}
+    # openai model names -> ordered faster-whisper model ids to try. The bare
+    # names need faster-whisper >= 1.1.0; the explicit HF repo id is the
+    # version-independent fallback (downloaded from HuggingFace on first use).
+    _ALIASES = {
+        "turbo": ["large-v3-turbo", "turbo", "deepdml/faster-whisper-large-v3-turbo-ct2"],
+        "large": ["large-v3", "large"],
+    }
 
     def __init__(self, model_name, language, initial_prompt, compute_type):
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        model_id = self._ALIASES.get(model_name, model_name)
-        self.model = WhisperModel(model_id, device=device, compute_type=compute_type)
+        candidates = self._ALIASES.get(model_name, [model_name])
+
+        self.model = None
+        last_err = None
+        for model_id in candidates:
+            try:
+                self.model = WhisperModel(model_id, device=device, compute_type=compute_type)
+                logging.info(f"faster-whisper loaded model id: {model_id}")
+                break
+            except Exception as e:
+                last_err = e
+                logging.warning(f"faster-whisper could not load '{model_id}': {e}")
+        if self.model is None:
+            raise RuntimeError(
+                f"No faster-whisper model id worked for '{model_name}'. "
+                f"Try: pip install -U faster-whisper. Last error: {last_err}"
+            )
+
         self.language = language
         self.initial_prompt = initial_prompt
 
