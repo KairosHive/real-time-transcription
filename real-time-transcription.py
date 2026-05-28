@@ -29,6 +29,8 @@ def main():
                         help="Prompt to bias the model toward domain vocabulary, names, or spelling.")
     parser.add_argument("--vad_aggressiveness", default=2, type=int, choices=[0, 1, 2, 3],
                         help="webrtcvad aggressiveness (0=least, 3=most). Lower keeps more soft speech.")
+    parser.add_argument("--final_beam_size", default=5, type=int,
+                        help="Beam width for the final, prompt-driving pass. Lower (e.g. 1) cuts GPU load on a busy GPU.")
     parser.add_argument("--initial_energy_threshold", default=1000,
                         help="Initial energy level for mic to detect.", type=int)
     parser.add_argument("--initial_record_timeout", default=0.7,
@@ -145,8 +147,10 @@ def main():
     # possible latency (beam search is ~5x slower and would make feedback lag).
     partial_options = dict(_common_options, beam_size=None, best_of=None, temperature=0.0)
     # The final pass runs once, when the utterance ends and feeds the image
-    # prompt, so it can afford beam search for the cleanest transcription.
-    final_options = dict(_common_options, beam_size=5, best_of=5, temperature=0.0)
+    # prompt, so it can afford beam search for the cleanest transcription. On a
+    # busy GPU, drop --final_beam_size to 1 to fall back to fast greedy decoding.
+    _final_beam = args.final_beam_size if args.final_beam_size > 1 else None
+    final_options = dict(_common_options, beam_size=_final_beam, best_of=_final_beam, temperature=0.0)
 
     def transcribe(audio_bytes, options):
         audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
