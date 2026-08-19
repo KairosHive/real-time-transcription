@@ -3,12 +3,12 @@ import argparse
 import sys
 
 import numpy as np
-import sounddevice as sd
-
-from .devices import describe, list_inputs
 
 
 def level_test(device, channels, samplerate, seconds):
+    import sounddevice as sd
+
+    from .devices import describe
     print(describe(device))
     print(f"opening {channels} ch @ {samplerate:g} Hz ...")
     peaks = np.zeros(channels, dtype=np.float32)
@@ -42,7 +42,14 @@ def main(argv=None):
     p.add_argument("--channels", type=int, default=8)
     p.add_argument("--samplerate", type=float, default=44100)
     p.add_argument("--seconds", type=float, default=8)
+    p.add_argument("--asio", action="store_true",
+                   help="load the ASIO-enabled PortAudio build")
     a = p.parse_args(argv)
+
+    if a.asio:
+        from .devices import enable_asio
+        enable_asio()
+    from .devices import list_inputs
 
     list_inputs()
     if a.device is not None:

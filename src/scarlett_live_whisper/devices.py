@@ -1,11 +1,26 @@
-"""Input device discovery and stream opening."""
+"""Input device discovery and stream opening.
+
+Import order matters: enable_asio() must run before sounddevice is imported,
+because sounddevice picks which PortAudio DLL to load at import time.
+"""
+import os
 import sys
 
-import sounddevice as sd
 
-# WDM-KS advertises the Focusrite endpoint but refuses float32, so it goes
-# last. MME and DirectSound both open all 8 analogue channels cleanly.
-API_ORDER = ("MME", "Windows DirectSound", "Windows WASAPI", "Windows WDM-KS")
+def enable_asio():
+    """Load the ASIO-enabled PortAudio build. Must precede `import sounddevice`."""
+    if "sounddevice" in sys.modules:
+        raise RuntimeError("enable_asio() called after sounddevice was imported")
+    os.environ["SD_ENABLE_ASIO"] = "1"
+
+
+import sounddevice as sd  # noqa: E402  (see enable_asio)
+
+# ASIO first when it is available: it is the only host API that exposes the
+# full channel count of an 18i20. WDM-KS advertises the Focusrite endpoint but
+# refuses float32, so it goes last.
+API_ORDER = ("ASIO", "MME", "Windows DirectSound", "Windows WASAPI",
+             "Windows WDM-KS")
 
 
 def list_inputs():
@@ -24,8 +39,8 @@ def list_inputs():
     print()
     print("host APIs available:", ", ".join(names))
     if not any("ASIO" in n for n in names):
-        print("NOTE: no ASIO host API in this PortAudio build -> ADAT/SPDIF")
-        print("      channels (9-18 on an 18i20) are not reachable.")
+        print("NOTE: ASIO is not loaded. The WDM endpoint exposes only 8 of")
+        print("      an 18i20's inputs. Re-run with --asio for all 20.")
 
 
 def device_candidates(spec, need_channels):
