@@ -153,24 +153,42 @@ So on WDM you get 2 channels. Use `--asio` for the rest.
 
 ### Enabling ASIO
 
-`sounddevice` ships two PortAudio builds and loads the non-ASIO one by
-default. `--asio` sets `SD_ENABLE_ASIO=1` so the ASIO build loads instead. No
-rebuild, no ASIO SDK, no extra download.
+`--asio` does **not** go through PortAudio. PortAudio instantiates *every*
+registered ASIO driver when it initialises, and one bad driver takes the whole
+process down — on the development machine, merely instantiating FlexASIO makes
+`Focusrite USB ASIO`'s `init()` segfault. Instead, `asio.py` is a small ctypes
+ASIO host that CoCreateInstances exactly the driver you name and never touches
+the others. Nothing on your system needs changing.
 
-**The catch:** PortAudio instantiates *every* registered ASIO driver at
-startup, and a single bad one takes down the process. On this machine
-FlexASIO is fatal — merely instantiating it makes `Focusrite USB ASIO`'s
-`init()` segfault. Loaded on its own, Focusrite USB ASIO initialises fine and
-reports 20 in / 20 out.
+```bash
+uv run scarlett-transcribe --asio --channels 8 --only 3,4
+```
 
-Diagnose your own machine by loading each registered driver in isolation:
+It reads real channel names from the driver, so transcripts are labelled
+`Input 3` rather than `ch3`.
+
+> ### The interface clock is shared — read this
+>
+> Opening an ASIO driver **claims the interface and switches the whole card to
+> the rate ASIO is configured for**. If Windows was playing at 48 kHz and the
+> ASIO side is set to 44.1 kHz, everything else on the card will glitch or
+> distort for as long as the capture runs, and recover when it stops.
+>
+> This is not something the code can paper over: the Focusrite driver refuses
+> `setSampleRate` to a rate its control panel is not set to (`canSampleRate`
+> returns an error). **Set the rate you want in Focusrite Control**, so ASIO
+> and Windows agree, and everything coexists.
+>
+> `scarlett-transcribe` never changes the clock on its own — it adopts
+> whatever the driver reports. Passing `--samplerate` asks for a specific
+> rate and fails loudly if the driver refuses, rather than silently retuning
+> your hardware.
+
+Diagnose which drivers are registered, and which one misbehaves:
 
 ```powershell
 Get-ChildItem 'HKLM:\SOFTWARE\ASIO' | Select-Object PSChildName
 ```
-
-If one crashes, unregister just that driver (export the key first so you can
-restore it) — the software itself can stay installed.
 
 ## Tests
 

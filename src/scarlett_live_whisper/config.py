@@ -48,3 +48,22 @@ def db(x):
     """Amplitude to dBFS, floored so silence prints as -inf-ish, not a crash."""
     import math
     return 20 * math.log10(max(float(x), 1e-9))
+
+
+def enable_portaudio_asio():
+    """Make sounddevice load the ASIO-enabled PortAudio DLL.
+
+    Must run before anything imports sounddevice, which is why it lives here
+    rather than in devices.py -- importing that module would itself pull
+    sounddevice in and make the call a no-op.
+
+    Note this routes through PortAudio, which instantiates EVERY registered
+    ASIO driver at startup; one bad driver crashes the process. The asio
+    module talks to a single driver directly and avoids that.
+    """
+    import os
+    import sys
+    if "sounddevice" in sys.modules:
+        raise RuntimeError("enable_portaudio_asio() called too late -- "
+                           "sounddevice is already imported")
+    os.environ["SD_ENABLE_ASIO"] = "1"

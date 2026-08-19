@@ -1,20 +1,7 @@
-"""Input device discovery and stream opening.
-
-Import order matters: enable_asio() must run before sounddevice is imported,
-because sounddevice picks which PortAudio DLL to load at import time.
-"""
-import os
+"""Input device discovery and stream opening (PortAudio / WDM backend)."""
 import sys
 
-
-def enable_asio():
-    """Load the ASIO-enabled PortAudio build. Must precede `import sounddevice`."""
-    if "sounddevice" in sys.modules:
-        raise RuntimeError("enable_asio() called after sounddevice was imported")
-    os.environ["SD_ENABLE_ASIO"] = "1"
-
-
-import sounddevice as sd  # noqa: E402  (see enable_asio)
+import sounddevice as sd
 
 # ASIO first when it is available: it is the only host API that exposes the
 # full channel count of an 18i20. WDM-KS advertises the Focusrite endpoint but

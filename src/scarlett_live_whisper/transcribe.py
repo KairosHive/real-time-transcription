@@ -35,8 +35,10 @@ def build_parser():
     p.add_argument("--device", default=None,
                    help="device index or name substring (default: auto)")
     p.add_argument("--channels", type=int, default=8)
-    p.add_argument("--samplerate", type=float, default=44100,
-                   help="must match the rate set in Focusrite Control")
+    p.add_argument("--samplerate", type=float, default=None,
+                   help="capture rate. ASIO adopts the interface's current "
+                        "clock unless you set this (which changes the clock "
+                        "for every other app too); WDM defaults to 44100")
     p.add_argument("--blocksize", type=int, default=2048,
                    help="raise this if you see input overflow")
     p.add_argument("--model", default=DEFAULT_MODEL)
@@ -62,8 +64,12 @@ def build_parser():
     p.add_argument("-v", "--verbose", action="store_true",
                    help="log every utterance detected, queued and filtered")
     p.add_argument("--asio", action="store_true",
-                   help="use the ASIO driver (all 20 channels on an 18i20) "
-                        "instead of the 8-channel WDM endpoint")
+                   help="capture through the ASIO driver directly, reaching "
+                        "every input. The WDM endpoint exposes only 1+2.")
+    p.add_argument("--asio-driver", default="focusrite usb",
+                   help="ASIO driver name or substring (default: %(default)s)")
+    p.add_argument("--asio-buffer", type=int, default=None,
+                   help="ASIO buffer size in frames (default: driver's own)")
     return p
 
 
@@ -127,15 +133,32 @@ def main(argv=None):
 
     con = Console(meter_enabled=not a.no_meter)
 
-    # Must happen before .devices imports sounddevice.
+    # Two capture backends. ASIO talks to one named driver directly; the WDM
+    # path goes through PortAudio, which would instantiate every ASIO driver
+    # on the machine and can be brought down by any one of them.
+    cap = cands = describe = open_stream = None
     if a.asio:
-        from .devices import enable_asio
-        enable_asio()
-    from .devices import describe, device_candidates, open_stream
-
-    cands = device_candidates(a.device, a.channels)
-    if a.verbose:
-        con.line(f"{DIM}device candidates, best first: {cands}{RESET}")
+        from .asio import AsioCapture, find_driver
+        try:
+            drv = find_driver(a.asio_driver)
+            cap = AsioCapture(drv, a.channels, samplerate=a.samplerate,
+                              buffer_size=a.asio_buffer).open()
+        except RuntimeError as e:
+            sys.exit(f"error: {e}")
+        stream_rate = cap.samplerate
+        if cap.changed_rate:
+            con.warn(f"changed the interface clock from "
+                     f"{cap.original_rate:g} to {cap.samplerate:g} Hz -- "
+                     f"other apps using this card will be affected")
+        if not a.names:  # the driver knows what its inputs are called
+            names = [cap.channel_names[c] or names[c]
+                     for c in range(a.channels)]
+    else:
+        from .devices import describe, device_candidates, open_stream
+        cands = device_candidates(a.device, a.channels)
+        stream_rate = a.samplerate or 44100
+        if a.verbose:
+            con.line(f"{DIM}device candidates, best first: {cands}{RESET}")
 
     from faster_whisper import WhisperModel
     con.line(f"loading {a.model} ...")
@@ -145,7 +168,7 @@ def main(argv=None):
     con.line(f"{DIM}model ready in {time.time() - t_load:.1f}s{RESET}")
 
     jobs = queue.Queue()
-    blocks = queue.Queue(maxsize=64)
+    blocks = cap.blocks if cap else queue.Queue(maxsize=64)
     log = open(a.out, "a", encoding="utf-8")
     t0 = time.time()
     stop = threading.Event()
@@ -161,12 +184,11 @@ def main(argv=None):
             con.warn(f"audio status: {status}")
         try:
             blocks.put_nowait(indata.copy())
-            stats["blocks"] += 1
         except queue.Full:
             stats["dropped"] += 1  # drop rather than stall the audio thread
 
     def resample_loop():
-        rs = soxr.ResampleStream(a.samplerate, TARGET_SR, a.channels,
+        rs = soxr.ResampleStream(stream_rate, TARGET_SR, a.channels,
                                  dtype="float32", quality="VHQ")
         segs = {c: Segmenter(a.threshold_db, a.hangover, a.min_speech,
                              a.max_utt, a.preroll) for c in active}
@@ -181,6 +203,9 @@ def main(argv=None):
                 blk = blocks.get(timeout=0.2)
             except queue.Empty:
                 continue
+            stats["blocks"] += 1
+            if cap:
+                stats["dropped"] = cap.dropped
             y = rs.resample_chunk(blk)
             if y.shape[0] == 0:
                 continue
@@ -289,13 +314,23 @@ def main(argv=None):
     for t in threads:
         t.start()
 
-    stream, dev = open_stream(cands, a.channels, a.samplerate, a.blocksize,
-                              capture)
-    con.line(f"\n{describe(dev)}")
-    con.line(f"{DIM}  (MME truncates device names to 31 chars; indices shift "
-             f"when other devices appear){RESET}")
-    con.line(f"  opened {stream.channels} ch @ {stream.samplerate:g} Hz "
-             f"-> {TARGET_SR} Hz, blocksize {a.blocksize}")
+    stream = None
+    if cap:
+        cap.start()
+        con.line(f"\nASIO [{drv}] -- {cap.max_inputs} in / "
+                 f"{cap.max_outputs} out available")
+        con.line(f"  opened {a.channels} ch @ {cap.samplerate:g} Hz "
+                 f"-> {TARGET_SR} Hz, buffer {cap.buffer_size} frames")
+    else:
+        stream, dev = open_stream(cands, a.channels, stream_rate,
+                                  a.blocksize, capture)
+        con.line(f"\n{describe(dev)}")
+        con.line(f"{DIM}  (MME truncates device names to 31 chars; indices "
+                 f"shift when other devices appear){RESET}")
+        con.line(f"  opened {stream.channels} ch @ {stream.samplerate:g} Hz "
+                 f"-> {TARGET_SR} Hz, blocksize {a.blocksize}")
+        con.warn("WDM exposes only Analogue 1+2 on a Scarlett; higher "
+                 "channels are padding. Use --asio for the rest.")
     con.line(f"  transcribing {[c + 1 for c in active]} "
              f"({', '.join(names[c] for c in active)}) | "
              f"{a.workers} workers | gate {a.threshold_db:g} dBFS")
@@ -309,8 +344,11 @@ def main(argv=None):
         pass
     finally:
         stop.set()
-        stream.stop()
-        stream.close()
+        if cap:
+            cap.stop()
+        else:
+            stream.stop()
+            stream.close()
         for t in threads:
             t.join(timeout=3)
         con.close()
