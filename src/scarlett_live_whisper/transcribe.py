@@ -89,6 +89,19 @@ def calibration_report(con, peak, rms, channels, active, threshold_db, secs):
                  f"{DIM}{sel}{RESET}")
     con.line(f"{DIM}gate = {threshold_db:.0f} dBFS rms{RESET}")
 
+    # A driver that advertises more channels than it has pads the extras with
+    # an identical silent stream. Real converters never match to 0.01 dB.
+    groups = {}
+    for c in range(channels):
+        if db(peak[c]) < -80:
+            groups.setdefault(round(db(rms[c]), 1), []).append(c + 1)
+    padding = max(groups.values(), key=len) if groups else []
+    if len(padding) >= 3:
+        con.warn(f"channels {padding} carry an identical silent stream "
+                 f"({round(db(rms[padding[0] - 1]), 1)} dBFS on every one).")
+        con.warn("that is driver padding, not real inputs -- this endpoint "
+                 "has fewer channels than it advertises. Try --asio.")
+
     live = [c + 1 for c in active if c + 1 not in quiet]
     if not live:
         con.warn("none of the selected channels showed speech-level signal.")

@@ -64,13 +64,14 @@ uv sync --extra cuda        # drop --extra cuda if CUDA/cuDNN are system-wide
 uv run scarlett-probe                          # list input devices
 uv run scarlett-probe --device 2 --seconds 8   # level-check each mic
 
-uv run scarlett-transcribe --channels 8 --language en
+uv run scarlett-transcribe --channels 2 --language en          # WDM: 1+2 only
+uv run scarlett-transcribe --asio --channels 20 --language en  # ASIO: everything
 ```
 
 Named channels, French, only the mics that matter:
 
 ```bash
-uv run scarlett-transcribe --channels 8 --only 1,2,5 \
+uv run scarlett-transcribe --asio --channels 20 --only 1,2,5 \
     --names Alice,Bob,,,Room --language fr
 ```
 
@@ -115,36 +116,61 @@ RTX 4090, `large-v3-turbo`, float16, 5-second utterances:
 | **3** | **59× realtime** | 0.25 s |
 | 6 | 53× realtime | 0.53 s |
 
-59× realtime means the GPU is nowhere near the bottleneck for 8 channels — the
+59× realtime means the GPU is nowhere near the bottleneck for 20 channels — the
 0.7 s silence hangover dominates. A far smaller GPU will keep up.
 
-## Channel count on Windows
+## Channel count on Windows: read this before anything else
 
-The Focusrite Windows WDM driver exposes **one 8-channel endpoint** (analogue
-1–8). On an 18i20, ADAT (9–16) and S/PDIF (17–18) are reachable **only over
-ASIO**, and the PortAudio bundled with `sounddevice` is built *without* an ASIO
-host API — it offers MME, DirectSound, WASAPI and WDM-KS only. Getting all 18
-needs a PortAudio built against the Steinberg ASIO SDK, or routing ADAT/SPDIF
-into channels 1–8 in Focusrite Control.
+**Windows can only capture Analogue 1+2 from this interface. Everything else
+needs ASIO.** This is measured, not inferred.
 
-Host API notes, measured:
+The Focusrite WDM driver publishes exactly one capture endpoint, `Analogue
+1 + 2`. MME, DirectSound and WDM-KS all *advertise* 8 input channels on it;
+WASAPI reports the truth, 2. Opening 8 and playing a source into physical
+inputs 3 and 4 gives:
 
-| Host API | Result |
-|---|---|
-| MME | opens 8 ch at 44.1 and 48 kHz — the default pick |
-| DirectSound | opens 8 ch, also fine |
-| WDM-KS | advertises 8 ch, **rejects float32** |
-| WASAPI | exposes the endpoint as stereo only |
+```
+ch1  peak  -38.4  rms  -56.9 dBFS   <- the mic, real
+ch2  peak  -84.3  rms  -95.3 dBFS   <- real, nothing plugged in
+ch3  peak  -90.3  rms  -96.7 dBFS   <- identical
+ch4  peak  -90.3  rms  -96.7 dBFS   <- identical
+ch5..8                              <- identical
+```
 
-Device selection tries candidates in that order and falls through on failure,
-so a bad first guess is not fatal.
+Channels 3–8 return a byte-identical silent stream. Independent converters
+never agree to 0.1 dB, so those are driver padding. The registry confirms it:
+only one Focusrite capture endpoint is ACTIVE, with no disabled ones to
+enable. `scarlett-transcribe` detects this pattern and warns during startup
+calibration.
 
-### Sample rate
+So on WDM you get 2 channels. Use `--asio` for the rest.
 
-Whisper wants 16 kHz; the Scarlett is locked to whatever Focusrite Control is
-set to (44.1 kHz here) and **cannot be opened at 16 kHz**. Capture runs at the
-card's rate and `soxr` resamples. Asking PortAudio for `rate=16000` directly
-either fails or gets silently mangled — pass `--samplerate` to match your card.
+| Host API | Input channels | Real? |
+|---|---|---|
+| MME / DirectSound / WDM-KS | claims 8 | **no — 2 real, 6 padded** |
+| WASAPI | 2 | yes, and honest about it |
+| ASIO (`--asio`) | **20 in / 20 out** | yes — the whole interface |
+
+### Enabling ASIO
+
+`sounddevice` ships two PortAudio builds and loads the non-ASIO one by
+default. `--asio` sets `SD_ENABLE_ASIO=1` so the ASIO build loads instead. No
+rebuild, no ASIO SDK, no extra download.
+
+**The catch:** PortAudio instantiates *every* registered ASIO driver at
+startup, and a single bad one takes down the process. On this machine
+FlexASIO is fatal — merely instantiating it makes `Focusrite USB ASIO`'s
+`init()` segfault. Loaded on its own, Focusrite USB ASIO initialises fine and
+reports 20 in / 20 out.
+
+Diagnose your own machine by loading each registered driver in isolation:
+
+```powershell
+Get-ChildItem 'HKLM:\SOFTWARE\ASIO' | Select-Object PSChildName
+```
+
+If one crashes, unregister just that driver (export the key first so you can
+restore it) — the software itself can stay installed.
 
 ## Tests
 
@@ -154,7 +180,7 @@ uv run pytest -m "not gpu" # logic only: no GPU, no sound card, runs in CI
 ```
 
 `tests/test_endtoend.py` places a synthesized utterance on channels 1, 3 and 6
-of an 8-channel board at staggered onsets and pushes it through the real
+of an 8-channel virtual board at staggered onsets and pushes it through the real
 resample → segment → transcribe path. It asserts every active channel is
 transcribed, onset timestamps land within 0.5 s, and the five silent channels
 never fire. The speech fixture is generated on demand with Windows SAPI.
