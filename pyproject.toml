@@ -40,6 +40,11 @@ scarlett-merge = "scarlett_live_whisper.merge:main"
 Repository = "https://github.com/USERNAME/scarlett-live-whisper"
 Issues = "https://github.com/USERNAME/scarlett-live-whisper/issues"
 
+[tool.uv]
+# ctranslate2 segfaults when it loads next to conda's OpenMP/MKL DLLs, so
+# never resolve to a conda interpreter -- use a uv-managed CPython only.
+python-preference = "only-managed"
+
 [dependency-groups]
 dev = ["pytest>=8.0"]
 

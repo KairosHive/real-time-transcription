@@ -49,11 +49,14 @@ cd scarlett-live-whisper
 uv sync --extra cuda        # drop --extra cuda if CUDA/cuDNN are system-wide
 ```
 
-> **Do not build the venv from a conda Python.** ctranslate2 loads alongside
+> **Never build the venv from a conda Python.** ctranslate2 loads alongside
 > conda's OpenMP/MKL DLLs and segfaults instantly inside `WhisperModel(...)` —
-> on CPU as well as GPU, so it looks like a CUDA problem and isn't. `uv sync`
-> uses a standalone CPython and avoids this. If you must use conda, run
-> `uv venv --python-preference only-managed`.
+> on CPU as well as GPU, so it looks like a CUDA problem and isn't.
+>
+> If Anaconda is on your PATH, plain `uv sync` *will* pick it and the GPU tests
+> will die with an access violation. This repo therefore pins
+> `python-preference = "only-managed"` in `pyproject.toml`, so uv downloads and
+> uses a standalone CPython instead. Leave that setting alone.
 
 ## Use
 
