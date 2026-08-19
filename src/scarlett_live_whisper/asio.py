@@ -115,7 +115,7 @@ class AsioCapture:
     """
 
     def __init__(self, driver_name, channels, samplerate=None,
-                 buffer_size=None, queue_size=64):
+                 buffer_size=None, queue_size=512):
         if sys.platform != "win32":
             raise RuntimeError("ASIO is Windows-only")
         self.driver_name = driver_name

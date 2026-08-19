@@ -82,3 +82,39 @@ def test_timestamps_are_monotonic(bursts):
 ])
 def test_clean(text, expected):
     assert clean(text) == expected
+
+
+def test_force_split_loses_no_audio():
+    """Continuous speech must tile contiguously: no gap between the end of one
+    utterance and the start of the next, which is what made long broadcasts
+    appear to lose chunks."""
+    rng = np.random.default_rng(7)
+    sig = rng.normal(0, 0.05, 60 * TARGET_SR).astype(np.float32)
+    got = _feed(Segmenter(max_utt_s=8.0), sig, 1024)
+    assert len(got) >= 5
+    for (s0, a0), (s1, _) in zip(got, got[1:]):
+        assert s0 + a0.size == s1, (
+            f"gap/overlap of {s1 - (s0 + a0.size)} samples between utterances")
+
+
+def test_force_split_lands_in_a_pause():
+    """The cut must fall in the quiet gap, not mid-word."""
+    quiet_at = 9.0
+    rng = np.random.default_rng(8)
+    sig = rng.normal(0, 0.05, 20 * TARGET_SR).astype(np.float32)
+    lo = int(quiet_at * TARGET_SR)
+    sig[lo:lo + TARGET_SR // 5] = rng.normal(
+        0, 1e-4, TARGET_SR // 5).astype(np.float32)      # 200 ms pause
+
+    got = _feed(Segmenter(max_utt_s=10.0, split_lookback_s=2.0), sig, 1024)
+    first_end = (got[0][0] + got[0][1].size) / TARGET_SR
+    assert quiet_at <= first_end <= quiet_at + 0.25, (
+        f"split at {first_end:.2f}s, expected inside the pause at {quiet_at}s")
+
+
+def test_force_split_respects_max_length():
+    rng = np.random.default_rng(9)
+    sig = rng.normal(0, 0.05, 40 * TARGET_SR).astype(np.float32)
+    got = _feed(Segmenter(max_utt_s=10.0, split_lookback_s=2.0), sig, 1024)
+    for _, a in got:
+        assert a.size / TARGET_SR <= 10.1

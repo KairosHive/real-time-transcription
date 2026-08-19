@@ -171,6 +171,9 @@ def main(argv=None):
     blocks = cap.blocks if cap else queue.Queue(maxsize=64)
     log = open(a.out, "a", encoding="utf-8")
     t0 = time.time()
+    # The log is appended across runs and `t` restarts at zero every time, so
+    # records need an absolute clock and a session tag to stay orderable.
+    session = time.strftime("%Y%m%dT%H%M%S", time.localtime(t0))
     stop = threading.Event()
 
     peak = np.zeros(a.channels, dtype=np.float64)
@@ -266,17 +269,21 @@ def main(argv=None):
                              f"{audio.size / TARGET_SR:.1f}s -> no speech "
                              f"(VAD or hallucination filter){RESET}")
                 continue
+            epoch = t0 + start / TARGET_SR
             rec = {
+                "session": session,
                 "channel": ch + 1,
                 "name": names[ch],
+                "epoch": round(epoch, 3),
                 "t": round(start / TARGET_SR, 2),
-                "wall": time.strftime("%H:%M:%S",
-                                      time.localtime(t0 + start / TARGET_SR)),
+                "wall": time.strftime("%Y-%m-%d %H:%M:%S",
+                                      time.localtime(epoch)),
                 "dur": round(audio.size / TARGET_SR, 2),
                 "text": text,
             }
             col = COLORS[ch % len(COLORS)]
-            con.line(f"{col}[{rec['wall']}] {rec['name']:<8}{RESET} {text}")
+            clock = rec["wall"].split()[1]
+            con.line(f"{col}[{clock}] {rec['name']:<8}{RESET} {text}")
             log.write(json.dumps(rec, ensure_ascii=False) + "\n")
             log.flush()
 
@@ -358,8 +365,9 @@ def main(argv=None):
         con.line(f"  transcribed       {stats['done'] - stats['filtered']}")
         con.line(f"  filtered as noise {stats['filtered']}")
         if stats["dropped"]:
-            con.warn(f"{stats['dropped']} audio blocks dropped -- "
-                     f"raise --blocksize")
+            knob = "--asio-buffer" if cap else "--blocksize"
+            con.warn(f"{stats['dropped']} audio blocks dropped -- that audio "
+                     f"was never transcribed. Raise {knob}.")
         if stats["errors"]:
             con.warn(f"{stats['errors']} worker errors")
         if stats["utts"] == 0 and stats["audio_s"] > 0:
