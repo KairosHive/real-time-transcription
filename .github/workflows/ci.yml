@@ -1,0 +1,24 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  logic-tests:
+    # The segmentation tests are pure numpy; the GPU and sound-card paths
+    # cannot run on a hosted runner and are deselected.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install PortAudio (sounddevice needs the shared library)
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: uv sync --group dev
+      - run: uv run pytest -m "not gpu"

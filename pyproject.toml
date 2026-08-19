@@ -1,0 +1,58 @@
+[project]
+name = "scarlett-live-whisper"
+version = "0.1.0"
+description = "Real-time parallel Whisper transcription across every input channel of a multi-channel audio interface"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{ name = "François Lespinasse" }]
+keywords = ["whisper", "transcription", "realtime", "multichannel", "asr",
+            "focusrite", "scarlett", "faster-whisper"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "sounddevice>=0.5.2",
+    "numpy>=2.0",
+    "soxr>=1.0",
+    "faster-whisper>=1.1.0",
+]
+
+[project.optional-dependencies]
+# CUDA runtime DLLs, needed on Windows unless they are already on the system.
+cuda = [
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
+]
+
+[project.scripts]
+scarlett-transcribe = "scarlett_live_whisper.transcribe:main"
+scarlett-probe = "scarlett_live_whisper.probe:main"
+scarlett-merge = "scarlett_live_whisper.merge:main"
+
+[project.urls]
+Repository = "https://github.com/USERNAME/scarlett-live-whisper"
+Issues = "https://github.com/USERNAME/scarlett-live-whisper/issues"
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/scarlett_live_whisper"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+markers = [
+    "gpu: needs a CUDA device and the Whisper model (deselect with -m 'not gpu')",
+]
